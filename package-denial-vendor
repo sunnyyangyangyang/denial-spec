@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+#
+# package-denial-vendor: seal Denial's offline vendor closure.
+#
+# A source build (packaging/fedora, or any chroot running the canonical
+# tools/denial-pc + tools/denial-flutter-engine pipeline) provisions every
+# input below $HOME on its first online run: the lock-pinned Flutter and
+# Skia fork checkouts, depot_tools, the Dart SDK, CIPD and vpython state,
+# the engine's gn/ninja build tree, the Cargo registry, and the Dart pub
+# cache. This tool seals that closure into one tarball plus an audit
+# manifest, for use as Source1/Source2 of packaging/fedora/denial.spec:
+# the spec's %prep unpacks it below $HOME, and %build then validates the
+# closure instead of fetching anything (see packaging/fedora/README.md,
+# "Offline rebuilds").
+#
+# Run this inside the build chroot right after a successful online build:
+#
+#   cd /builddir/denial-0.4.3
+#   tools/package-denial-vendor /builddir/denial-vendor-0.4.3.tar.gz
+#
+# Copy the tarball and the generated .manifest.txt out of the chroot and
+# keep them with the spec (the spec expects the exact names
+# denial-vendor-<version>.tar.gz / denial-vendor-<version>.manifest.txt).
+# Sealing and consuming must use chroots with the same layout
+# ($HOME=/builddir, same distro) so the engine's gn/ninja build tree
+# stays path-valid; a closure sealed elsewhere still builds offline, but
+# the engine recompiles from its sealed sources.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
+ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+SOURCE_LOCK="$ROOT/prebuilt/flutter-engine/SOURCE_LOCK.json"
+
+fail() {
+  printf 'package-denial-vendor: %s\n' "$1" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: tools/package-denial-vendor [OPTIONS] OUTFILE
+
+Seal the $HOME vendor closure of a completed online build into OUTFILE
+(.tar.gz by default, .tar.zst with --zstd) plus an audit manifest named
+after OUTFILE without its archive suffix, with .manifest.txt appended.
+
+Options:
+  --zstd           Compress with zstd instead of gzip (faster for big
+                   closures; the consuming spec must then extract with
+                   'tar --zstd -xpf' instead of 'tar -xzf').
+  --version VALUE  Stamp the Denial version or tag into the manifest.
+  --extra-dir DIR  Seal DIR as well (absolute, or relative to $HOME).
+  -h, --help       Show this help.
+
+By default the closure seals the space-separated paths in
+DENIAL_VENDOR_DIRS below $HOME, or '.cache .config .cargo .pub-cache'
+when that variable is unset. The managed cache layout
+($HOME/.cache/denial/{pc-dependencies,flutter-engine,pc-build}) is the
+sealed contract; overrides (DENIAL_FLUTTER_SDK_ROOT,
+DENIAL_FLUTTER_ENGINE_CACHE_ROOT, XDG_CACHE_HOME) are refused so a
+half-sealed closure can never be produced.
+EOF
+}
+
+COMPRESS=""
+STAMP_VERSION=""
+EXTRA_DIRS=()
+OUTFILE=""
+while (($#)); do
+  case "$1" in
+    --zstd) COMPRESS="zstd" ;;
+    --version)
+      if (($# < 2)); then fail '--version needs a value'; fi
+      STAMP_VERSION="$2"
+      shift
+      ;;
+    --extra-dir)
+      if (($# < 2)); then fail '--extra-dir needs a value'; fi
+      EXTRA_DIRS+=("$2")
+      shift
+      ;;
+    -h|--help) usage; exit 0 ;;
+    -*) usage >&2; fail "unknown option: $1" ;;
+    *)
+      if [[ -n "$OUTFILE" ]]; then
+        usage >&2
+        fail "expected exactly one OUTFILE, got extra argument: $1"
+      fi
+      OUTFILE="$1"
+      ;;
+  esac
+  shift
+done
+if [[ -z "$OUTFILE" ]]; then usage >&2; exit 1; fi
+
+[[ -n "${HOME:?HOME is required}" ]] || fail "HOME is required"
+command -v jq >/dev/null 2>&1 || fail 'jq is required (it is a BuildRequires of the spec)'
+[[ -f "$SOURCE_LOCK" ]] || fail "missing source lock: $SOURCE_LOCK (run from the source checkout, e.g. /builddir/denial-<version>)"
+
+case "$OUTFILE" in
+  *.tar.gz|*.tgz) : ;;
+  *.tar.zst) COMPRESS="zstd" ;;
+  *) fail "OUTFILE must end in .tar.gz, .tgz, or .tar.zst: $OUTFILE" ;;
+esac
+
+# The managed cache layout is the sealed contract. Any override relocates
+# part of the closure outside $HOME/.cache and would leave it unsealed.
+if [[ -n "${DENIAL_FLUTTER_SDK_ROOT:-}" || -n "${DENIAL_FLUTTER_ENGINE_CACHE_ROOT:-}" ]]; then
+  fail 'seal the managed default layout: unset DENIAL_FLUTTER_SDK_ROOT / DENIAL_FLUTTER_ENGINE_CACHE_ROOT (run inside a plain build chroot)'
+fi
+if [[ -n "${XDG_CACHE_HOME:-}" && "${XDG_CACHE_HOME}" != "$HOME/.cache" ]]; then
+  fail 'seal with the default cache home: unset XDG_CACHE_HOME (the tools resolve every cache root from $HOME)'
+fi
+if [[ -e /mnt/exty/denial-flutter-fork-3.44.7 ]]; then
+  fail 'canonical /mnt/exty source roots are visible; seal from a chroot without them, where the managed layout lives entirely below $HOME'
+fi
+
+CACHE_HOME="$HOME/.cache"
+SDK_ROOT="$CACHE_HOME/denial/pc-dependencies/flutter"
+ENGINE_ROOT="$CACHE_HOME/denial/flutter-engine"
+ENGINE_CHECKOUT="$ENGINE_ROOT/checkout"
+
+# --- The closure must be complete before it is sealed ------------------
+require_dir() {
+  if [[ ! -d "$1" ]]; then
+    fail "closure incomplete: missing $1 (run a full online build first)"
+  fi
+}
+require_dir "$SDK_ROOT"
+require_dir "$ENGINE_CHECKOUT"
+require_dir "$ENGINE_ROOT/depot_tools"
+require_dir "$ENGINE_ROOT/build"
+
+check_clean_checkout() {
+  local label="$1" path="$2" revision="$3"
+  if ! git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    fail "$label is not a git checkout: $path"
+  fi
+  if [[ "$(git -C "$path" rev-parse HEAD)" != "$revision" ]]; then
+    fail "$label is at $(git -C "$path" rev-parse HEAD), expected $revision (SOURCE_LOCK.json)"
+  fi
+  if [[ -n "$(git -C "$path" status --porcelain --untracked-files=no)" ]]; then
+    fail "$label checkout has tracked modifications: $path"
+  fi
+}
+
+FLUTTER_REPOSITORY="$(jq -er '.flutter.repository' "$SOURCE_LOCK")"
+FLUTTER_REVISION="$(jq -er '.flutter.revision' "$SOURCE_LOCK")"
+SKIA_REPOSITORY="$(jq -er '.skia.repository' "$SOURCE_LOCK")"
+SKIA_REVISION="$(jq -er '.skia.revision' "$SOURCE_LOCK")"
+DEPOT_REPOSITORY="$(jq -er '.depot_tools.repository' "$SOURCE_LOCK")"
+DEPOT_REVISION="$(jq -er '.depot_tools.revision' "$SOURCE_LOCK")"
+
+check_clean_checkout 'Flutter SDK checkout' "$SDK_ROOT" "$FLUTTER_REVISION"
+check_clean_checkout 'Flutter engine checkout' "$ENGINE_CHECKOUT" "$FLUTTER_REVISION"
+check_clean_checkout 'Skia' "$ENGINE_CHECKOUT/engine/src/flutter/third_party/skia" "$SKIA_REVISION"
+check_clean_checkout 'depot_tools' "$ENGINE_CHECKOUT/engine/src/flutter/third_party/depot_tools" "$DEPOT_REVISION"
+
+if [[ ! -f "$SDK_ROOT/bin/cache/dart-sdk/version" ]]; then
+  fail "Dart SDK is not cached below $SDK_ROOT/bin/cache (finish the online build first)"
+fi
+if [[ ! -f "$SDK_ROOT/bin/cache/engine.stamp" ]]; then
+  fail "Flutter engine cache stamps are missing below $SDK_ROOT/bin/cache (finish the online build first)"
+fi
+
+ENGINE_SO_SHA256=""
+PREBUILT_ENGINE="$ROOT/prebuilt/flutter-engine/linux-x64-release/libflutter_engine.so"
+PREBUILT_PIN="$ROOT/prebuilt/flutter-engine/linux-x64-release/libflutter_engine.so.sha256"
+if [[ -f "$PREBUILT_ENGINE" && -f "$PREBUILT_PIN" ]]; then
+  ENGINE_SO_SHA256="$(sha256sum -- "$PREBUILT_ENGINE" | cut -d' ' -f1)"
+  if [[ "$ENGINE_SO_SHA256" != "$(cut -d' ' -f1 <"$PREBUILT_PIN")" ]]; then
+    fail 'the built libflutter_engine.so does not match the source tree pin; do not seal a closure whose engine failed verification'
+  fi
+fi
+
+# --- Nothing sealed may escape $HOME (e.g. symlinks into /mnt/exty) ----
+DIRS=()
+if [[ -n "${DENIAL_VENDOR_DIRS:-}" ]]; then
+  read -r -a DIRS <<< "${DENIAL_VENDOR_DIRS}"
+else
+  DIRS=(.cache .config .cargo .pub-cache)
+fi
+for d in "${EXTRA_DIRS[@]}"; do
+  case "$d" in
+    /*)
+      case "$d" in
+        "$HOME"/*) DIRS+=("${d#"$HOME"/}") ;;
+        *) fail "--extra-dir must be below $HOME (got $d)" ;;
+      esac
+      ;;
+    *) DIRS+=("$d") ;;
+  esac
+done
+
+SEAL_EXISTING=()
+for d in "${DIRS[@]}"; do
+  if [[ -e "$HOME/$d" ]]; then
+    SEAL_EXISTING+=("$d")
+    while IFS= read -r -d '' link; do
+      resolved="$(realpath -m -- "$link")"
+      case "$resolved" in
+        "$HOME"/*|/usr/*|/bin/*|/lib/*|/lib64/*|/etc/*|/opt/*|/snap/*) : ;;
+        *) printf 'warning: symlink escapes the sealed closure: %s -> %s\n' "$link" "$resolved" >&2 ;;
+      esac
+    done < <(find "$HOME/$d" -type l -print0)
+  else
+    printf 'warning: sealing non-existent path %s (skipped)\n' "$d" >&2
+  fi
+done
+if ((${#SEAL_EXISTING[@]} == 0)); then
+  fail 'nothing to seal: no default closure path exists below $HOME'
+fi
+
+# --- Seal ----------------------------------------------------------------
+MANIFEST="${OUTFILE%.tar.gz}"
+MANIFEST="${MANIFEST%.tgz}"
+MANIFEST="${MANIFEST%.tar.zst}.manifest.txt"
+
+printf 'Sealing %d path(s) below %s into %s\n' "${#SEAL_EXISTING[@]}" "$HOME" "$OUTFILE"
+if [[ "$COMPRESS" == "zstd" ]]; then
+  tar --create --use-compress-program="zstd -T0 -19" --hard-links \
+    --file="$OUTFILE" --numeric-owner --directory="$HOME" "${SEAL_EXISTING[@]}"
+else
+  tar --create --gzip --hard-links \
+    --file="$OUTFILE" --numeric-owner --directory="$HOME" "${SEAL_EXISTING[@]}"
+fi
+
+TMP_MANIFEST="$(mktemp -- "${MANIFEST}.XXXXXX")"
+{
+  printf '# Denial vendor closure manifest\n'
+  printf 'sealed_by: tools/package-denial-vendor (source root %s)\n' "$ROOT"
+  printf 'sealed_at: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [[ -n "$STAMP_VERSION" ]]; then
+    printf 'denial_version: %s\n' "$STAMP_VERSION"
+  fi
+  printf 'sealed_home: %s\n' "$HOME"
+  printf 'flutter_repository: %s\n' "$FLUTTER_REPOSITORY"
+  printf 'flutter_revision: %s\n' "$FLUTTER_REVISION"
+  printf 'skia_repository: %s\n' "$SKIA_REPOSITORY"
+  printf 'skia_revision: %s\n' "$SKIA_REVISION"
+  printf 'depot_tools_repository: %s\n' "$DEPOT_REPOSITORY"
+  printf 'depot_tools_revision: %s\n' "$DEPOT_REVISION"
+  printf 'dart_sdk_version: %s\n' "$(<"$SDK_ROOT/bin/cache/dart-sdk/version")"
+  if [[ -n "$ENGINE_SO_SHA256" ]]; then
+    printf 'engine_so_sha256: %s\n' "$ENGINE_SO_SHA256"
+  fi
+  printf 'sealed_paths:\n'
+  for d in "${SEAL_EXISTING[@]}"; do
+    printf '  %s\n' "$d"
+  done
+  printf 'tarball: %s\n' "$(basename -- "$OUTFILE")"
+} >"$TMP_MANIFEST"
+sha256sum -- "$OUTFILE" | awk '{printf "tarball_sha256: %s\n", $1}' >>"$TMP_MANIFEST"
+mv -- "$TMP_MANIFEST" "$MANIFEST"
+
+printf '\nSealed vendor closure:\n'
+ls -lh -- "$OUTFILE" "$MANIFEST"
+printf '\nNext steps:\n'
+printf '  copy %s and %s out of the chroot\n' "$OUTFILE" "$MANIFEST"
+printf '  keep them with packaging/fedora/denial.spec; the spec expects the\n'
+printf '  exact names denial-vendor-<version>.tar.gz / .manifest.txt (Source1/Source2)\n'
+
